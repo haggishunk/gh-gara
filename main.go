@@ -39,12 +39,13 @@ func getCurrentBranch() (string, error) {
 }
 
 // parseTicketIDs finds Jira/Linear-style ticket IDs (e.g. PROJ-123) in a branch name.
+// Matching is case-insensitive; IDs are normalized to uppercase.
 func parseTicketIDs(branch string) []ticketRef {
-	re := regexp.MustCompile(`[A-Z]+-\d+`)
+	re := regexp.MustCompile(`(?i)[A-Z]+-\d+`)
 	matches := re.FindAllString(branch, -1)
 	refs := make([]ticketRef, 0, len(matches))
 	for _, m := range matches {
-		refs = append(refs, ticketRef{ID: m})
+		refs = append(refs, ticketRef{ID: strings.ToUpper(m)})
 	}
 	return refs
 }
