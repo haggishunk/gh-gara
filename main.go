@@ -31,6 +31,15 @@ type claudeResult struct {
 	IsError bool   `json:"is_error"`
 }
 
+// gitRunFunc executes a git subcommand and returns trimmed stdout.
+type gitRunFunc func(args ...string) (string, error)
+
+// runGit is the default gitRunFunc used in production.
+func runGit(args ...string) (string, error) {
+	out, err := exec.Command("git", args...).Output()
+	return strings.TrimSpace(string(out)), err
+}
+
 func getCurrentBranch() (string, error) {
 	out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
@@ -71,37 +80,48 @@ func getDefaultBranch() (string, error) {
 
 // getUpstreamBranch returns the local name of the configured upstream for the
 // current branch (stripping the remote prefix). Returns "" when no upstream is
-// configured or when the upstream resolves to the current branch itself.
-func getUpstreamBranch(currentBranch string) string {
-	out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "@{upstream}").Output()
+// configured, when the upstream resolves to the current branch itself, or when
+// the upstream local name is "HEAD" (e.g. origin/HEAD).
+func getUpstreamBranch(currentBranch string, run gitRunFunc) string {
+	out, err := run("rev-parse", "--abbrev-ref", "@{upstream}")
 	if err != nil {
 		return ""
 	}
-	upstream := strings.TrimSpace(string(out))
+	upstream := out
 	// Strip remote prefix (e.g. "origin/develop" → "develop")
 	parts := strings.SplitN(upstream, "/", 2)
 	if len(parts) == 2 {
 		upstream = parts[1]
 	}
-	if upstream == "" || upstream == currentBranch {
+	if upstream == "" || upstream == "HEAD" || upstream == currentBranch {
 		return ""
 	}
 	return upstream
 }
 
 // listRemoteBranches returns all remote-tracking branch refs, excluding HEAD
-// pointer lines (e.g. "origin/HEAD -> origin/main").
-func listRemoteBranches() ([]string, error) {
-	out, err := exec.Command("git", "branch", "-r", "--format=%(refname:short)").Output()
+// pointer entries (both "origin/HEAD" and "origin/HEAD -> origin/main" forms).
+func listRemoteBranches(run gitRunFunc) ([]string, error) {
+	out, err := run("branch", "-r", "--format=%(refname:short)")
 	if err != nil {
 		return nil, fmt.Errorf("listing remote branches: %w", err)
 	}
 	var branches []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
-		if line != "" && !strings.Contains(line, "->") {
-			branches = append(branches, line)
+		if line == "" || strings.Contains(line, "->") {
+			continue
 		}
+		// Skip origin/HEAD — not a real branch.
+		parts := strings.SplitN(line, "/", 2)
+		localName := line
+		if len(parts) == 2 {
+			localName = parts[1]
+		}
+		if localName == "HEAD" {
+			continue
+		}
+		branches = append(branches, line)
 	}
 	return branches, nil
 }
@@ -109,19 +129,18 @@ func listRemoteBranches() ([]string, error) {
 // mergeBaseCommitCount returns the number of commits between the merge-base of
 // HEAD and the given remote branch ref. Returns math.MaxInt when the
 // merge-base cannot be computed (unrelated histories, shallow clone, etc.).
-func mergeBaseCommitCount(remoteBranchRef string) int {
-	mbOut, err := exec.Command("git", "merge-base", "HEAD", remoteBranchRef).Output()
+func mergeBaseCommitCount(remoteBranchRef string, run gitRunFunc) int {
+	mergeBase, err := run("merge-base", "HEAD", remoteBranchRef)
 	if err != nil {
 		return math.MaxInt
 	}
-	mergeBase := strings.TrimSpace(string(mbOut))
 
-	countOut, err := exec.Command("git", "rev-list", "--count", mergeBase+"..HEAD").Output()
+	countOut, err := run("rev-list", "--count", mergeBase+"..HEAD")
 	if err != nil {
 		return math.MaxInt
 	}
 	var count int
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(countOut)), "%d", &count); err != nil {
+	if _, err := fmt.Sscanf(countOut, "%d", &count); err != nil {
 		return math.MaxInt
 	}
 	return count
@@ -131,17 +150,16 @@ func mergeBaseCommitCount(remoteBranchRef string) int {
 // HEAD, using merge-base commit count as the distance metric. currentBranch is
 // used to skip the branch's own remote tracking ref. Returns defaultBranch if
 // no suitable candidate is found.
-func nearestRemoteBranch(currentBranch, defaultBranch string) string {
-	remotes, err := listRemoteBranches()
+func nearestRemoteBranch(currentBranch, defaultBranch string, run gitRunFunc) string {
+	remotes, err := listRemoteBranches(run)
 	if err != nil || len(remotes) == 0 {
 		return defaultBranch
 	}
 
-	headOut, err := exec.Command("git", "rev-parse", "HEAD").Output()
+	headHash, err := run("rev-parse", "HEAD")
 	if err != nil {
 		return defaultBranch
 	}
-	headHash := strings.TrimSpace(string(headOut))
 
 	bestBranch := defaultBranch
 	bestCount := math.MaxInt
@@ -157,17 +175,17 @@ func nearestRemoteBranch(currentBranch, defaultBranch string) string {
 			continue
 		}
 
-		count := mergeBaseCommitCount(ref)
+		count := mergeBaseCommitCount(ref, run)
 		if count == math.MaxInt {
 			continue
 		}
 
 		// Skip branches whose merge-base is HEAD itself (descendant branches).
-		mbOut, err := exec.Command("git", "merge-base", "HEAD", ref).Output()
+		mbHash, err := run("merge-base", "HEAD", ref)
 		if err != nil {
 			continue
 		}
-		if strings.TrimSpace(string(mbOut)) == headHash {
+		if mbHash == headHash {
 			continue
 		}
 
@@ -185,11 +203,11 @@ func nearestRemoteBranch(currentBranch, defaultBranch string) string {
 //  2. Nearest remote ancestor by merge-base commit count
 //
 // Falls back to defaultBranch if neither stage produces a result.
-func detectBaseBranch(currentBranch, defaultBranch string) string {
-	if upstream := getUpstreamBranch(currentBranch); upstream != "" {
+func detectBaseBranch(currentBranch, defaultBranch string, run gitRunFunc) string {
+	if upstream := getUpstreamBranch(currentBranch, run); upstream != "" {
 		return upstream
 	}
-	return nearestRemoteBranch(currentBranch, defaultBranch)
+	return nearestRemoteBranch(currentBranch, defaultBranch, run)
 }
 
 func getCommitLog(base string) (string, error) {
@@ -339,7 +357,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	baseBranch := detectBaseBranch(branch, defaultBranch)
+	baseBranch := detectBaseBranch(branch, defaultBranch, runGit)
 
 	commits, err := getCommitLog(baseBranch)
 	if err != nil {
