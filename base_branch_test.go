@@ -336,3 +336,28 @@ func TestDetectBaseBranch_NoUpstreamFallsToNearest(t *testing.T) {
 		t.Errorf("expected %q, got %q", "main", got)
 	}
 }
+
+// --- appendTicketSuffix ---
+
+func TestAppendTicketSuffix_NoTickets(t *testing.T) {
+	got := appendTicketSuffix("Fix login bug", nil)
+	if got != "Fix login bug" {
+		t.Errorf("expected unchanged title, got %q", got)
+	}
+}
+
+func TestAppendTicketSuffix_SingleTicket(t *testing.T) {
+	got := appendTicketSuffix("Fix login bug", []ticketRef{{ID: "PROJ-123"}})
+	want := "Fix login bug [PROJ-123]"
+	if got != want {
+		t.Errorf("expected %q, got %q", want, got)
+	}
+}
+
+func TestAppendTicketSuffix_MultipleTickets(t *testing.T) {
+	got := appendTicketSuffix("Fix login bug", []ticketRef{{ID: "PROJ-123"}, {ID: "PROJ-456"}})
+	want := "Fix login bug [PROJ-123, PROJ-456]"
+	if got != want {
+		t.Errorf("expected %q, got %q", want, got)
+	}
+}

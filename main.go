@@ -275,7 +275,7 @@ func buildPrompt(branch string, tickets []ticketRef, commits string) string {
 		}
 		sb.WriteString("\nUse your available MCP tools to look up these tickets in Jira or Linear. ")
 		sb.WriteString("Use the ticket title, type, and description to produce:\n")
-		sb.WriteString("  - title: a concise PR title that reflects the ticket's purpose\n")
+		sb.WriteString("  - title: a concise PR title that reflects the ticket's purpose (do NOT include the ticket ID in the title)\n")
 		sb.WriteString("  - body: a description covering what the ticket is about, what changed, and any relevant context\n\n")
 	} else {
 		sb.WriteString("No ticket IDs found in the branch name.\n")
@@ -341,6 +341,21 @@ func parsePRContent(claudeOutput string) (*prContent, error) {
 	}
 
 	return &pr, nil
+}
+
+// appendTicketSuffix appends ticket IDs as a bracketed suffix to the PR title,
+// e.g. "Fix login bug [PROJ-123]". Multiple tickets are comma-separated:
+// "Fix login bug [PROJ-123, PROJ-456]". If tickets is empty, title is returned
+// unchanged.
+func appendTicketSuffix(title string, tickets []ticketRef) string {
+	if len(tickets) == 0 {
+		return title
+	}
+	ids := make([]string, len(tickets))
+	for i, t := range tickets {
+		ids[i] = t.ID
+	}
+	return fmt.Sprintf("%s [%s]", title, strings.Join(ids, ", "))
 }
 
 func createPR(title, body, head, base string) error {
@@ -425,6 +440,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+
+	pr.Title = appendTicketSuffix(pr.Title, tickets)
 
 	fmt.Printf("title: %s\n\n", pr.Title)
 	fmt.Printf("body:\n%s\n", pr.Body)
