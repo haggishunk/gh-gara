@@ -89,6 +89,41 @@ func TestListRemoteBranches_Error(t *testing.T) {
 	}
 }
 
+// --- listLocalBranches ---
+
+func TestListLocalBranches_Normal(t *testing.T) {
+	run := mockRunner(map[string]string{
+		"branch --format=%(refname:short)": "main\ndevelop\nfeature/foo",
+	})
+	branches, err := listLocalBranches(run)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(branches) != 3 {
+		t.Errorf("expected 3 branches, got %d: %v", len(branches), branches)
+	}
+}
+
+func TestListLocalBranches_Empty(t *testing.T) {
+	run := mockRunner(map[string]string{
+		"branch --format=%(refname:short)": "",
+	})
+	branches, err := listLocalBranches(run)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(branches) != 0 {
+		t.Errorf("expected 0 branches, got %d", len(branches))
+	}
+}
+
+func TestListLocalBranches_Error(t *testing.T) {
+	_, err := listLocalBranches(errRunner)
+	if err == nil {
+		t.Error("expected error, got nil")
+	}
+}
+
 // --- getUpstreamBranch ---
 
 func TestGetUpstreamBranch_Normal(t *testing.T) {
@@ -223,6 +258,37 @@ func TestNearestRemoteBranch_FallsBackToDefault(t *testing.T) {
 	got := nearestRemoteBranch("feature/x", "main", run)
 	if got != "main" {
 		t.Errorf("expected %q, got %q", "main", got)
+	}
+}
+
+func TestNearestRemoteBranch_LocalBranchWinsOverStaleRemote(t *testing.T) {
+	// Simulates the scenario where origin/deploy-prod is stale (its remote
+	// tracking ref points far behind HEAD) but the local deploy-prod branch is
+	// a direct 2-commit ancestor. The local ref should produce a lower count
+	// and win over origin/develop which has an intermediate distance.
+	headHash := "993a74a1"
+	localDeployMergeBase := "b52ef160" // local deploy-prod is a direct ancestor
+	staleRemoteMergeBase := "00000001" // origin/deploy-prod hasn't been fetched recently
+	developMergeBase := "cccccccc"
+
+	run := mockRunner(map[string]string{
+		"branch -r --format=%(refname:short)": "origin/deploy-prod\norigin/develop",
+		"branch --format=%(refname:short)":    "deploy-prod\ndevelop",
+		"rev-parse HEAD":                      headHash,
+		// origin/deploy-prod: stale → large count
+		"merge-base HEAD origin/deploy-prod":                    staleRemoteMergeBase,
+		"rev-list --count " + staleRemoteMergeBase + "..HEAD":   "50",
+		// local deploy-prod: direct ancestor → small count
+		"merge-base HEAD deploy-prod":                           localDeployMergeBase,
+		"rev-list --count " + localDeployMergeBase + "..HEAD":   "2",
+		// origin/develop and local develop: intermediate distance
+		"merge-base HEAD origin/develop":                        developMergeBase,
+		"merge-base HEAD develop":                               developMergeBase,
+		"rev-list --count " + developMergeBase + "..HEAD":       "10",
+	})
+	got := nearestRemoteBranch("feature/my-branch", "main", run)
+	if got != "deploy-prod" {
+		t.Errorf("expected %q (local branch beats stale remote), got %q", "deploy-prod", got)
 	}
 }
 
