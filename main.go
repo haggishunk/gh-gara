@@ -126,6 +126,23 @@ func listRemoteBranches(run gitRunFunc) ([]string, error) {
 	return branches, nil
 }
 
+// listLocalBranches returns all local branch names, excluding HEAD.
+func listLocalBranches(run gitRunFunc) ([]string, error) {
+	out, err := run("branch", "--format=%(refname:short)")
+	if err != nil {
+		return nil, fmt.Errorf("listing local branches: %w", err)
+	}
+	var branches []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "HEAD" {
+			continue
+		}
+		branches = append(branches, line)
+	}
+	return branches, nil
+}
+
 // mergeBaseCommitCount returns the number of commits between the merge-base of
 // HEAD and the given remote branch ref. Returns math.MaxInt when the
 // merge-base cannot be computed (unrelated histories, shallow clone, etc.).
@@ -146,13 +163,41 @@ func mergeBaseCommitCount(remoteBranchRef string, run gitRunFunc) int {
 	return count
 }
 
-// nearestRemoteBranch finds the remote branch that is the nearest ancestor of
-// HEAD, using merge-base commit count as the distance metric. currentBranch is
-// used to skip the branch's own remote tracking ref. Returns defaultBranch if
-// no suitable candidate is found.
+// nearestRemoteBranch finds the nearest ancestor of HEAD by considering both
+// remote-tracking refs and local branches. Scoring both ensures that a local
+// branch whose remote tracking ref is stale (e.g. origin/deploy-prod points to
+// an older commit than local deploy-prod) still scores correctly. currentBranch
+// is excluded from candidates. Returns defaultBranch if no suitable candidate
+// is found.
 func nearestRemoteBranch(currentBranch, defaultBranch string, run gitRunFunc) string {
-	remotes, err := listRemoteBranches(run)
-	if err != nil || len(remotes) == 0 {
+	type candidate struct {
+		ref       string // git ref used for merge-base (e.g. "origin/deploy-prod" or "deploy-prod")
+		localName string // branch name to return as the PR base
+	}
+
+	remotes, _ := listRemoteBranches(run)
+	locals, _ := listLocalBranches(run)
+
+	var candidates []candidate
+	for _, ref := range remotes {
+		parts := strings.SplitN(ref, "/", 2)
+		localName := ref
+		if len(parts) == 2 {
+			localName = parts[1]
+		}
+		if localName == "HEAD" || localName == currentBranch {
+			continue
+		}
+		candidates = append(candidates, candidate{ref: ref, localName: localName})
+	}
+	for _, name := range locals {
+		if name == currentBranch {
+			continue
+		}
+		candidates = append(candidates, candidate{ref: name, localName: name})
+	}
+
+	if len(candidates) == 0 {
 		return defaultBranch
 	}
 
@@ -164,24 +209,14 @@ func nearestRemoteBranch(currentBranch, defaultBranch string, run gitRunFunc) st
 	bestBranch := defaultBranch
 	bestCount := math.MaxInt
 
-	for _, ref := range remotes {
-		// Skip the current branch's own remote tracking ref.
-		parts := strings.SplitN(ref, "/", 2)
-		localName := ref
-		if len(parts) == 2 {
-			localName = parts[1]
-		}
-		if localName == currentBranch {
-			continue
-		}
-
-		count := mergeBaseCommitCount(ref, run)
+	for _, c := range candidates {
+		count := mergeBaseCommitCount(c.ref, run)
 		if count == math.MaxInt {
 			continue
 		}
 
 		// Skip branches whose merge-base is HEAD itself (descendant branches).
-		mbHash, err := run("merge-base", "HEAD", ref)
+		mbHash, err := run("merge-base", "HEAD", c.ref)
 		if err != nil {
 			continue
 		}
@@ -191,7 +226,7 @@ func nearestRemoteBranch(currentBranch, defaultBranch string, run gitRunFunc) st
 
 		if count < bestCount {
 			bestCount = count
-			bestBranch = localName
+			bestBranch = c.localName
 		}
 	}
 
@@ -240,7 +275,7 @@ func buildPrompt(branch string, tickets []ticketRef, commits string) string {
 		}
 		sb.WriteString("\nUse your available MCP tools to look up these tickets in Jira or Linear. ")
 		sb.WriteString("Use the ticket title, type, and description to produce:\n")
-		sb.WriteString("  - title: a concise PR title that reflects the ticket's purpose\n")
+		sb.WriteString("  - title: a concise PR title that reflects the ticket's purpose (do NOT include the ticket ID in the title)\n")
 		sb.WriteString("  - body: a description covering what the ticket is about, what changed, and any relevant context\n\n")
 	} else {
 		sb.WriteString("No ticket IDs found in the branch name.\n")
@@ -306,6 +341,21 @@ func parsePRContent(claudeOutput string) (*prContent, error) {
 	}
 
 	return &pr, nil
+}
+
+// appendTicketSuffix appends ticket IDs as a bracketed suffix to the PR title,
+// e.g. "Fix login bug [PROJ-123]". Multiple tickets are comma-separated:
+// "Fix login bug [PROJ-123, PROJ-456]". If tickets is empty, title is returned
+// unchanged.
+func appendTicketSuffix(title string, tickets []ticketRef) string {
+	if len(tickets) == 0 {
+		return title
+	}
+	ids := make([]string, len(tickets))
+	for i, t := range tickets {
+		ids[i] = t.ID
+	}
+	return fmt.Sprintf("%s [%s]", title, strings.Join(ids, ", "))
 }
 
 func createPR(title, body, head, base string) error {
@@ -390,6 +440,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+
+	pr.Title = appendTicketSuffix(pr.Title, tickets)
 
 	fmt.Printf("title: %s\n\n", pr.Title)
 	fmt.Printf("body:\n%s\n", pr.Body)
